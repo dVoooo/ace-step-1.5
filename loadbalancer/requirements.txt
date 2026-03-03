@@ -1,0 +1,13 @@
+# ACE-Step Load Balancer Worker Dependencies
+# FastAPI and uvicorn for the web server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+
+# HTTP client for proxying requests
+httpx==0.27.2
+
+# Python 3.11+ standard library modules used:
+# - os, sys, json, asyncio, logging, threading (built-in)
+# - contextlib (built-in)
+# - typing (built-in)
