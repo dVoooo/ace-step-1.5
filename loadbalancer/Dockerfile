@@ -133,7 +133,7 @@ COPY loadbalancer/ /app/loadbalancer/
 WORKDIR /app/loadbalancer
 
 # Install loadbalancer dependencies
-RUN uv pip install --system --no-cache -r requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Go back to /app
 WORKDIR /app
