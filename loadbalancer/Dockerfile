@@ -86,11 +86,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     ACESTEP_LM_BACKEND=pt \
     # Server configuration
     ACESTEP_API_HOST=127.0.0.1 \
-    ACESTEP_API_PORT=8000 \
+    ACESTEP_API_PORT=8001 \
     ACESTEP_INTERNAL_API_HOST=127.0.0.1 \
     # Loadbalancer configuration
     PORT=8000 \
-    PORT_HEALTH=8001 \
+    PORT_HEALTH=8000 \
     RUNPOD_MODE=loadbalancer
 
 WORKDIR /app
@@ -146,14 +146,13 @@ RUN chmod +x /app/start_loadbalancer.sh
 RUN mkdir -p /app/outputs
 
 # Expose ports:
-# - 8000: Main API proxy (for Runpod to call)
-# - 8001: Health check /ping endpoint (for Runpod health checks)
-# - 8000: Internal ACE-Step API (not exposed externally)
+# - 8000: Main API proxy and health check (for Runpod to call)
+# - 8001: Internal ACE-Step API (not exposed externally)
 EXPOSE 8000 8001
 
 # Health check for the loadbalancer worker
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8001/ping')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/ping')" || exit 1
 
 # Run the loadbalancer startup script
 CMD ["/app/start_loadbalancer.sh"]

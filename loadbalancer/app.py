@@ -3,26 +3,23 @@
 Load Balancer Worker for ACE-Step 1.5 REST API
 
 This FastAPI application serves as a load balancing worker for Runpod Serverless.
-It proxies requests to the ACE-Step API server running on a separate port and
-provides a separate /ping endpoint for Runpod health checks.
+It proxies requests to the ACE-Step API server running on a separate internal port
+and provides a /ping endpoint for Runpod health checks on the same port.
 
 Key features:
-- Separate /ping endpoint on PORT_HEALTH for Runpod health checks
+- Single port (8000) for both health checks and API proxy
 - Proxies all ACE-Step API endpoints to the internal API server
-- Supports both serverless (queue + handler) and loadbalancer modes
+- Health check verifies internal API is running
 """
 
 import os
 import sys
-import json
-import asyncio
 import logging
 import threading
-from typing import Optional, Dict, Any, List
-from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
 import uvicorn
 import httpx
 
@@ -37,41 +34,64 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
-# Internal API server configuration
+# Internal API server configuration (on a different port)
 API_REQUEST_HOST = os.environ.get("ACESTEP_INTERNAL_API_HOST", "127.0.0.1")
-API_PORT = int(os.environ.get("ACESTEP_API_PORT", "8000"))
+API_PORT = int(os.environ.get("ACESTEP_API_PORT", "8001"))
 API_BASE_URL = f"http://{API_REQUEST_HOST}:{API_PORT}"
 
-# Health check port (separate from main API port for Runpod load balancer)
-HEALTH_PORT = int(os.environ.get("PORT_HEALTH", os.environ.get("PORT", 8000)))
-
-# Main API port
-API_PORT_MAIN = int(os.environ.get("PORT", 8000))
-
-# Startup configuration
-STARTUP_TIMEOUT = int(os.environ.get("ACESTEP_API_STARTUP_TIMEOUT", "900"))
-POLL_INTERVAL = int(os.environ.get("ACESTEP_POLL_INTERVAL", "3"))
+# Main server port (same as PORT env var for Runpod)
+PORT = int(os.environ.get("PORT", 8000))
 
 # HTTP client timeout
 HTTP_TIMEOUT = float(os.environ.get("ACESTEP_HTTP_TIMEOUT", "300.0"))
+
+logger.info(f"Internal API URL: {API_BASE_URL}")
+logger.info(f"Main server port: {PORT}")
 
 # =============================================================================
 # Global state
 # =============================================================================
 
-_api_server_process = None
 _http_client: Optional[httpx.AsyncClient] = None
 
 
 # =============================================================================
-# Health check server (runs on separate port)
+# FastAPI Application
 # =============================================================================
 
-health_app = FastAPI(title="ACE-Step Health Check")
+app = FastAPI(
+    title="ACE-Step Load Balancer",
+    description="Load balancer worker for ACE-Step 1.5 REST API with health checks",
+    version="1.5.0"
+)
 
 
-@health_app.get("/ping")
-@health_app.get("/health")
+@app.on_event("startup")
+async def startup():
+    """Initialize HTTP client on startup."""
+    global _http_client
+    logger.info("Starting ACE-Step Load Balancer...")
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(HTTP_TIMEOUT),
+        follow_redirects=True
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Cleanup HTTP client on shutdown."""
+    global _http_client
+    logger.info("Shutting down ACE-Step Load Balancer...")
+    if _http_client:
+        await _http_client.aclose()
+
+
+# =============================================================================
+# Health check endpoint
+# =============================================================================
+
+@app.get("/ping")
+@app.get("/health")
 async def health_check():
     """
     Health check endpoint for Runpod load balancer.
@@ -79,18 +99,19 @@ async def health_check():
     This endpoint is called by Runpod to verify the worker is healthy.
     It checks if the internal API server is running and responsive.
     """
+    global _http_client
+    
     try:
         # Check if internal API is healthy
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{API_BASE_URL}/health")
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("data", {}).get("status") == "ok":
-                    return {
-                        "status": "healthy",
-                        "api_status": "ok",
-                        "service": "ACE-Step Load Balancer"
-                    }
+        response = await _http_client.get(f"{API_BASE_URL}/health", timeout=10.0)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("data", {}).get("status") == "ok":
+                return {
+                    "status": "healthy",
+                    "api_status": "ok",
+                    "service": "ACE-Step Load Balancer"
+                }
         
         return JSONResponse(
             status_code=503,
@@ -121,61 +142,25 @@ async def health_check():
         )
 
 
-@health_app.get("/")
+# =============================================================================
+# Root endpoint
+# =============================================================================
+
+@app.get("/")
 async def root():
-    """Root endpoint for health check server."""
-    return {"message": "ACE-Step Health Check Server", "endpoints": ["/ping", "/health"]}
-
-
-def run_health_server():
-    """Run the health check server on the designated port."""
-    logger.info(f"Starting health check server on port {HEALTH_PORT}")
-    uvicorn.run(
-        health_app,
-        host="0.0.0.0",
-        port=HEALTH_PORT,
-        log_level="info"
-    )
-
-
-# =============================================================================
-# Main API proxy server
-# =============================================================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context manager for startup and shutdown."""
-    global _http_client
-    
-    # Startup
-    logger.info("Starting ACE-Step Load Balancer API server...")
-    _http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(HTTP_TIMEOUT),
-        follow_redirects=True
-    )
-    
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down ACE-Step Load Balancer API server...")
-    if _http_client:
-        await _http_client.aclose()
-
-
-# Create main FastAPI app
-main_app = FastAPI(
-    title="ACE-Step API Proxy",
-    description="Load balancer worker for ACE-Step 1.5 REST API",
-    version="1.5.0",
-    lifespan=lifespan
-)
+    """Root endpoint."""
+    return {
+        "message": "ACE-Step API Proxy",
+        "version": "1.5.0",
+        "docs": "Use /release_task, /query_result, /v1/audio, /v1/models, /v1/stats endpoints"
+    }
 
 
 # =============================================================================
 # Proxy endpoints - forward requests to internal ACE-Step API
 # =============================================================================
 
-@main_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_request(path: str, request: Request):
     """
     Proxy all requests to the internal ACE-Step API server.
@@ -238,16 +223,6 @@ async def proxy_request(path: str, request: Request):
         )
 
 
-@main_app.get("/")
-async def root():
-    """Root endpoint - redirect to health check."""
-    return {
-        "message": "ACE-Step API Proxy",
-        "version": "1.5.0",
-        "docs": "Use /release_task, /query_result, /v1/audio, /v1/models, /v1/stats endpoints"
-    }
-
-
 # =============================================================================
 # Main entry point
 # =============================================================================
@@ -258,51 +233,26 @@ def main():
     
     parser = argparse.ArgumentParser(description="ACE-Step Load Balancer Worker")
     parser.add_argument(
-        "--mode",
-        choices=["health", "api", "both"],
-        default="both",
-        help="Run mode: health (ping server), api (proxy server), or both"
+        "--port",
+        type=int,
+        default=PORT,
+        help="Port for the server"
     )
     parser.add_argument(
-        "--health-port",
-        type=int,
-        default=HEALTH_PORT,
-        help="Port for health check server"
-    )
-    parser.add_argument(
-        "--api-port",
-        type=int,
-        default=API_PORT_MAIN,
-        help="Port for API proxy server"
+        "--host",
+        default="0.0.0.0",
+        help="Host to bind to"
     )
     
     args = parser.parse_args()
     
-    if args.mode == "health":
-        run_health_server()
-    elif args.mode == "api":
-        uvicorn.run(
-            main_app,
-            host="0.0.0.0",
-            port=args.api_port,
-            log_level="info"
-        )
-    else:  # both
-        # Run health server in a separate thread
-        health_thread = threading.Thread(
-            target=run_health_server,
-            daemon=True
-        )
-        health_thread.start()
-        
-        # Run main API server in the main thread
-        logger.info(f"Starting main API server on port {args.api_port}")
-        uvicorn.run(
-            main_app,
-            host="0.0.0.0",
-            port=args.api_port,
-            log_level="info"
-        )
+    logger.info(f"Starting ACE-Step Load Balancer on {args.host}:{args.port}")
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info"
+    )
 
 
 if __name__ == "__main__":
