@@ -70,7 +70,7 @@ PY
 # -----------------------------------------------------------------------------
 # Stage 2: Runtime - Install ACE-Step and loadbalancer worker
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04 as runtime
+FROM nvidia/cuda:12.8.0-base-ubuntu22.04 as runtime
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -133,7 +133,7 @@ COPY loadbalancer/ /app/loadbalancer/
 WORKDIR /app/loadbalancer
 
 # Install loadbalancer dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN uv pip install --system --no-cache -r requirements.txt .
 
 # Go back to /app
 WORKDIR /app
