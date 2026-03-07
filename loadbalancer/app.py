@@ -10,11 +10,15 @@ Key features:
 - Single port (8000) for both health checks and API proxy
 - Proxies all ACE-Step API endpoints to the internal API server
 - Health check verifies internal API is running
-- /metrics returns RunPod-compatible {"available": N} schema
+- POST / implements the RunPod job-format bridge so that RunPod's test runner
+  (and regular serverless invocations) work without a separate handler.py
 """
 
-import os
+import asyncio
+import json
 import logging
+import os
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -47,6 +51,11 @@ HTTP_TIMEOUT = float(os.environ.get("ACESTEP_HTTP_TIMEOUT", "300.0"))
 
 # RunPod API Key for authentication (required for load balancer health checks)
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
+
+# Job handler defaults (mirrors handler.py so tests.json works unchanged)
+DEFAULT_DURATION = int(os.environ.get("ACESTEP_DEFAULT_DURATION", "90"))
+DEFAULT_POLL_INTERVAL = float(os.environ.get("ACESTEP_POLL_INTERVAL", "3"))
+DEFAULT_JOB_TIMEOUT = int(os.environ.get("ACESTEP_JOB_TIMEOUT", "1800"))
 
 logger.info(f"Internal API URL: {API_BASE_URL}")
 logger.info(f"Main server port: {PORT}")
@@ -136,28 +145,24 @@ async def health_check():
 
 
 # =============================================================================
-# RunPod Metrics endpoint (required for load balancer routing weight)
+# RunPod Metrics endpoint (not required by RunPod spec but kept as extension)
 # =============================================================================
 
 @app.get("/metrics")
 async def metrics(authorization: Optional[str] = Header(None)):
     """
-    Metrics endpoint for RunPod load balancer.
+    Optional metrics endpoint.
 
-    RunPod's serverless load balancer requires this endpoint to determine
-    routing weight. It MUST return {"available": N} where N >= 1 means
-    the worker can accept requests, and N == 0 means it is busy/loading.
-
-    The endpoint is called with Authorization: Bearer <RUNPOD_API_KEY>.
+    Returns {"available": 1} when the internal API is ready, {"available": 0}
+    while the model is still loading. Authorization via Bearer token is
+    validated when RUNPOD_API_KEY is set.
     """
-    # Validate authorization if RUNPOD_API_KEY is configured
     if RUNPOD_API_KEY:
         if not authorization:
             return JSONResponse(
                 status_code=403,
                 content={"error": "Missing authorization header"}
             )
-
         auth_scheme, _, token = authorization.partition(' ')
         if auth_scheme.lower() != 'bearer' or token != RUNPOD_API_KEY:
             return JSONResponse(
@@ -165,14 +170,12 @@ async def metrics(authorization: Optional[str] = Header(None)):
                 content={"error": "Invalid authorization"}
             )
 
-    # Return RunPod-required schema: {"available": N}
-    # available=1 → worker is ready; available=0 → model still loading
     available = 1 if await _internal_api_healthy() else 0
     return {"available": available}
 
 
 # =============================================================================
-# Root endpoint
+# Root GET endpoint (informational)
 # =============================================================================
 
 @app.get("/")
@@ -186,7 +189,134 @@ async def root():
 
 
 # =============================================================================
-# Proxy endpoints - forward requests to internal ACE-Step API
+# RunPod job-format bridge  (POST /)
+#
+# RunPod's serverless test runner — and regular RunPod /run invocations sent
+# to a load-balancer endpoint — POST a job payload to the root path:
+#
+#   POST /
+#   {"id": "job-xxx", "input": {"caption": "...", "duration": 30, ...}}
+#
+# This handler translates that into the ACE-Step REST API calls (same logic as
+# handler.py), then returns the result in the RunPod output envelope:
+#
+#   {"output": {"task_id": "...", "status": "completed", "results": [...]}}
+#   {"error":  "..."}          ← on failure
+# =============================================================================
+
+@app.post("/")
+async def runpod_job_handler(request: Request):
+    """
+    RunPod job-format bridge.
+
+    Accepts the RunPod job envelope {"id": ..., "input": {...}}, drives the
+    ACE-Step generation pipeline, and returns {"output": {...}}.
+    """
+    global _http_client
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
+
+    job_input = body.get("input", {})
+
+    caption = (job_input.get("caption") or "").strip()
+    if not caption:
+        return JSONResponse(content={"error": "Input 'caption' is required"})
+
+    lyrics = job_input.get("lyrics") or ""
+    duration = int(job_input.get("duration", DEFAULT_DURATION))
+    batch_size = int(job_input.get("batch_size", 1))
+    timeout_seconds = int(job_input.get("timeout_seconds", DEFAULT_JOB_TIMEOUT))
+    poll_interval = float(job_input.get("poll_interval", DEFAULT_POLL_INTERVAL))
+
+    logger.info(
+        f"Job received — caption='{caption[:60]}' duration={duration}s "
+        f"batch_size={batch_size} timeout={timeout_seconds}s"
+    )
+
+    # ------------------------------------------------------------------
+    # Submit generation task to internal ACE-Step API
+    # ------------------------------------------------------------------
+    try:
+        submit_resp = await _http_client.post(
+            f"{API_BASE_URL}/release_task",
+            json={
+                "caption": caption,
+                "lyrics": lyrics,
+                "duration": duration,
+                "batch_size": batch_size,
+            },
+            timeout=30.0,
+        )
+        submit_data = submit_resp.json()
+    except Exception as exc:
+        logger.error(f"Failed to submit task: {exc}")
+        return JSONResponse(content={"error": f"Failed to contact internal API: {exc}"})
+
+    if submit_data.get("code") != 200:
+        err = submit_data.get("error") or f"Unexpected code {submit_data.get('code')}"
+        logger.error(f"Task submission failed: {err}")
+        return JSONResponse(content={"error": err})
+
+    task_id = (submit_data.get("data") or {}).get("task_id")
+    if not task_id:
+        return JSONResponse(content={"error": "Task submitted but no task_id was returned"})
+
+    logger.info(f"Task submitted: {task_id}")
+
+    # ------------------------------------------------------------------
+    # Poll until the task completes, fails, or times out
+    # ------------------------------------------------------------------
+    started_at = time.time()
+
+    while True:
+        elapsed = time.time() - started_at
+        if elapsed > timeout_seconds:
+            return JSONResponse(
+                content={"error": f"Generation timed out after {int(elapsed)}s"}
+            )
+
+        try:
+            poll_resp = await _http_client.post(
+                f"{API_BASE_URL}/query_result",
+                json={"task_id_list": [task_id]},
+                timeout=30.0,
+            )
+            poll_data = poll_resp.json()
+        except Exception as exc:
+            logger.warning(f"Poll request failed (will retry): {exc}")
+            await asyncio.sleep(poll_interval)
+            continue
+
+        items = poll_data.get("data") or []
+        if items:
+            task_result = items[0]
+            status = task_result.get("status", 0)
+
+            if status == 1:  # completed
+                result_data = json.loads(task_result.get("result") or "[]")
+                logger.info(f"Task {task_id} completed in {int(elapsed)}s")
+                return {
+                    "output": {
+                        "task_id": task_id,
+                        "status": "completed",
+                        "duration": duration,
+                        "batch_size": batch_size,
+                        "results": result_data,
+                    }
+                }
+
+            if status == 2:  # failed
+                logger.error(f"Task {task_id} failed")
+                return JSONResponse(content={"error": "Generation failed"})
+
+        await asyncio.sleep(poll_interval)
+
+
+# =============================================================================
+# Catch-all proxy — forward every other request to internal ACE-Step API
 # =============================================================================
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -194,62 +324,46 @@ async def proxy_request(path: str, request: Request):
     """
     Proxy all requests to the internal ACE-Step API server.
 
-    This handles all API endpoints including:
-    - POST /release_task - Submit generation task
-    - POST /query_result - Query task results
-    - GET /v1/audio - Download audio files
-    - GET /v1/models - List available models
-    - GET /v1/stats - Get server statistics
-    - And all other ACE-Step API endpoints
+    Handles:
+    - POST /release_task  — submit generation task
+    - POST /query_result  — query task results
+    - GET  /v1/audio      — download audio files
+    - GET  /v1/models     — list available models
+    - GET  /v1/stats      — server statistics
     """
     global _http_client
 
-    # Build the target URL
     target_url = f"{API_BASE_URL}/{path}"
-
-    # Get request body
     body = await request.body()
-
-    # Prepare headers (exclude host header)
-    headers = dict(request.headers)
-    headers.pop("host", None)
+    headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
 
     try:
-        # Forward the request
         proxy_response = await _http_client.request(
             method=request.method,
             url=target_url,
             content=body,
             headers=headers,
-            params=request.query_params
+            params=request.query_params,
         )
-
-        # Return the response
         return Response(
             content=proxy_response.content,
             status_code=proxy_response.status_code,
             headers=dict(proxy_response.headers),
-            media_type=proxy_response.headers.get("content-type", "application/json")
+            media_type=proxy_response.headers.get("content-type", "application/json"),
         )
 
-    except httpx.ConnectError as e:
-        logger.error(f"Failed to connect to internal API: {e}")
+    except httpx.ConnectError as exc:
+        logger.error(f"Failed to connect to internal API: {exc}")
         raise HTTPException(
             status_code=503,
             detail=f"Internal API server not available at {API_BASE_URL}"
         )
-    except httpx.TimeoutException as e:
-        logger.error(f"Request to internal API timed out: {e}")
-        raise HTTPException(
-            status_code=504,
-            detail="Internal API request timed out"
-        )
-    except Exception as e:
-        logger.error(f"Proxy error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Proxy error: {str(e)}"
-        )
+    except httpx.TimeoutException as exc:
+        logger.error(f"Request to internal API timed out: {exc}")
+        raise HTTPException(status_code=504, detail="Internal API request timed out")
+    except Exception as exc:
+        logger.error(f"Proxy error: {exc}")
+        raise HTTPException(status_code=500, detail=f"Proxy error: {exc}")
 
 
 # =============================================================================
@@ -261,27 +375,12 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="ACE-Step Load Balancer Worker")
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=PORT,
-        help="Port for the server"
-    )
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Host to bind to"
-    )
-
+    parser.add_argument("--port", type=int, default=PORT, help="Port for the server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     args = parser.parse_args()
 
     logger.info(f"Starting ACE-Step Load Balancer on {args.host}:{args.port}")
-    uvicorn.run(
-        app,
-        host=args.host,
-        port=args.port,
-        log_level="info"
-    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":
