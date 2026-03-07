@@ -47,7 +47,7 @@ while true; do
         break
     fi
     
-    ELAPSED=$(($(date +$STARTED_AT) - $STARTED_AT))
+    ELAPSED=$(( $(date +%s) - STARTED_AT ))
     if [ $ELAPSED -gt $TIMEOUT ]; then
         echo "ERROR: Timeout waiting for API server to start"
         kill $API_PID 2>/dev/null || true
@@ -89,5 +89,7 @@ echo "  - API server: /app/outputs/api.log"
 echo "  - Load Balancer: /app/outputs/loadbalancer.log"
 echo ""
 
-# Wait for all processes
-wait
+# Exit as soon as any child process terminates (requires bash 4.3+)
+# This ensures the container restarts if either the API or load balancer dies.
+wait -n
+exit $?
